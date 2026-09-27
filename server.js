@@ -2157,7 +2157,17 @@ class DuoRoom {
     if (hit) {
       const ship = opp.ships.find(s => s.id === shipId);
       ship.hits++;
-      if (ship.hits >= ship.size) ship.sunk = true;
+      if (ship.hits >= ship.size) {
+        ship.sunk = true;
+        // Marque toutes les cases de ce navire en "sunk" (au lieu de "hit") des deux côtés,
+        // pour que le client sache exactement quel navire vient d'être coulé et l'affiche en entier.
+        for (let rr = 0; rr < BS_GRID; rr++) for (let cc = 0; cc < BS_GRID; cc++) {
+          if (opp.board[rr][cc] === shipId) {
+            opp.shotsReceived[rr][cc] = "sunk";
+            me.shotsMade[rr][cc] = "sunk";
+          }
+        }
+      }
     }
     if (opp.ships.every(s => s.sunk)) { this.status = "ended"; this.winner = num; }
     else { this.turn = opponentNum; }
