@@ -2058,8 +2058,8 @@ class Room {
 
 // ---- Mode Duo : combat de fusées en ligne, 2 joueurs, salle légère à part ----
 // ---- Mode Duo : Bataille Navale en ligne, tour par tour, chacun sur son appareil ----
-const BS_GRID = 8;
-const BS_SHIPS = [4, 3, 3, 2, 2]; // tailles des navires à placer
+const BS_GRID = 9;
+const BS_SHIPS = [5, 4, 3, 3, 2, 2]; // tailles des navires à placer
 const DUO_IDLE_CLEANUP_MS = 1000 * 60 * 30;
 
 function bsEmptyGrid() { return Array.from({ length: BS_GRID }, () => Array(BS_GRID).fill(null)); }
@@ -2388,23 +2388,76 @@ function ckDirsFor(piece) {
   if (piece.king) return [[-1, -1], [-1, 1], [1, -1], [1, 1]];
   return piece.owner === 1 ? [[1, -1], [1, 1]] : [[-1, -1], [-1, 1]];
 }
-// Renvoie null si le coup n'est pas légal, sinon {capture:null} (coup simple) ou {capture:{r,c}} (une prise).
-// Simplification volontaire : pas de prise obligatoire, pas de rafle en chaîne (un coup = un déplacement ou une prise).
-function ckValidMove(board, num, fr, fc, tr, tc) {
-  const piece = board[fr] && board[fr][fc];
-  if (!piece || piece.owner !== num) return null;
-  if (!ckInBounds(tr, tc) || board[tr][tc]) return null;
-  const dirs = ckDirsFor(piece);
-  const dr = tr - fr, dc = tc - fc;
-  for (const [ddr, ddc] of dirs) {
-    if (dr === ddr && dc === ddc) return { capture: null };
-    if (dr === ddr * 2 && dc === ddc * 2) {
-      const mr = fr + ddr, mc = fc + ddc;
-      const mid = board[mr] && board[mr][mc];
-      if (mid && mid.owner !== num) return { capture: { r: mr, c: mc } };
+// ---- Règles des dames (dames « brésiliennes » 8x8) ----
+// - prise obligatoire (si on peut prendre, on doit prendre) ;
+// - les pions prennent en avant ET en arrière ; les dames sont « volantes » (se déplacent et prennent de loin) ;
+// - rafle : après une prise, si la même pièce peut encore prendre, elle doit continuer ;
+// - on choisit librement le chemin (pas d'obligation de prendre le maximum) ;
+// - les pièces prises restent sur le plateau (et bloquent) jusqu'à la fin de la rafle ;
+// - un pion qui finit son tour sur la dernière rangée devient dame.
+const CK_DIAGS = [[-1, -1], [-1, 1], [1, -1], [1, 1]];
+// Prises possibles pour la pièce en (r,c). `taken` = cases déjà prises pendant la rafle (non re-prenables, mais bloquantes).
+function ckCaptureOptions(board, num, r, c, taken) {
+  const piece = board[r][c];
+  const out = [];
+  if (!piece) return out;
+  const isTaken = (rr, cc) => taken.some(t => t[0] === rr && t[1] === cc);
+  for (const [dr, dc] of CK_DIAGS) {
+    if (piece.king) {
+      let rr = r + dr, cc = c + dc;
+      while (ckInBounds(rr, cc) && !board[rr][cc]) { rr += dr; cc += dc; }
+      if (!ckInBounds(rr, cc)) continue;
+      const victim = board[rr][cc];
+      if (victim.owner === num || isTaken(rr, cc)) continue;
+      let lr = rr + dr, lc = cc + dc;
+      while (ckInBounds(lr, lc) && !board[lr][lc]) { out.push({ tr: lr, tc: lc, cr: rr, cc: cc }); lr += dr; lc += dc; }
+    } else {
+      const mr = r + dr, mc = c + dc, lr = r + 2 * dr, lc = c + 2 * dc;
+      if (!ckInBounds(lr, lc) || !board[mr][mc] || board[lr][lc]) continue;
+      if (board[mr][mc].owner === num || isTaken(mr, mc)) continue;
+      out.push({ tr: lr, tc: lc, cr: mr, cc: mc });
     }
   }
-  return null;
+  return out;
+}
+// Déplacements simples (sans prise) de la pièce en (r,c).
+function ckSimpleMoves(board, num, r, c) {
+  const piece = board[r][c];
+  const out = [];
+  if (!piece) return out;
+  if (piece.king) {
+    for (const [dr, dc] of CK_DIAGS) {
+      let rr = r + dr, cc = c + dc;
+      while (ckInBounds(rr, cc) && !board[rr][cc]) { out.push({ tr: rr, tc: cc }); rr += dr; cc += dc; }
+    }
+  } else {
+    const fwd = num === 1 ? 1 : -1;
+    for (const dc of [-1, 1]) {
+      const rr = r + fwd, cc = c + dc;
+      if (ckInBounds(rr, cc) && !board[rr][cc]) out.push({ tr: rr, tc: cc });
+    }
+  }
+  return out;
+}
+// Liste complète des coups légaux {fr,fc,tr,tc,capture} pour `num`, en tenant compte de la prise obligatoire et de la rafle en cours.
+function ckLegalMoves(board, num, chain) {
+  const moves = [];
+  if (chain) {
+    for (const o of ckCaptureOptions(board, num, chain.r, chain.c, chain.taken)) moves.push({ fr: chain.r, fc: chain.c, tr: o.tr, tc: o.tc, capture: true });
+    return moves;
+  }
+  for (let r = 0; r < CK_SIZE; r++) for (let c = 0; c < CK_SIZE; c++) {
+    const p = board[r][c];
+    if (!p || p.owner !== num) continue;
+    for (const o of ckCaptureOptions(board, num, r, c, [])) moves.push({ fr: r, fc: c, tr: o.tr, tc: o.tc, capture: true });
+  }
+  if (moves.length) return moves; // prise obligatoire
+  for (let r = 0; r < CK_SIZE; r++) for (let c = 0; c < CK_SIZE; c++) {
+    const p = board[r][c];
+    if (!p || p.owner !== num) continue;
+    for (const m of ckSimpleMoves(board, num, r, c)) moves.push({ fr: r, fc: c, tr: m.tr, tc: m.tc, capture: false });
+  }
+  return moves;
 }
 class CheckersRoom {
   constructor(code) {
@@ -2437,34 +2490,46 @@ class CheckersRoom {
   handleMove(num, fr, fc, tr, tc) {
     if (this.status !== "playing" || this.turn !== num) return;
     if (![fr, fc, tr, tc].every(Number.isInteger)) return;
-    const result = ckValidMove(this.board, num, fr, fc, tr, tc);
-    if (!result) return;
+    const legal = ckLegalMoves(this.board, num, this.chain);
+    const mv = legal.find(m => m.fr === fr && m.fc === fc && m.tr === tr && m.tc === tc);
+    if (!mv) return;
     const piece = this.board[fr][fc];
+    this.lastActivity = Date.now();
+    this.moveSeq = (this.moveSeq || 0) + 1;
     this.board[tr][tc] = piece;
     this.board[fr][fc] = null;
-    if (result.capture) this.board[result.capture.r][result.capture.c] = null;
+    if (mv.capture) {
+      // trouve la pièce prise sur la diagonale parcourue
+      const dr = Math.sign(tr - fr), dc = Math.sign(tc - fc);
+      let rr = fr + dr, cc = fc + dc, victim = null;
+      while (rr !== tr || cc !== tc) { if (this.board[rr][cc]) victim = [rr, cc]; rr += dr; cc += dc; }
+      const taken = (this.chain ? this.chain.taken : []).concat([victim]);
+      this.board[victim[0]][victim[1]].taken = true;
+      this.lastMove = { fr, fc, tr, tc, capture: true, seq: this.moveSeq };
+      if (ckCaptureOptions(this.board, num, tr, tc, taken).length) {
+        this.chain = { r: tr, c: tc, taken }; // la rafle continue : même joueur, même pièce
+        this.broadcast();
+        return;
+      }
+      for (const [vr, vc] of taken) this.board[vr][vc] = null;
+    } else {
+      this.lastMove = { fr, fc, tr, tc, capture: false, seq: this.moveSeq };
+    }
+    this.chain = null;
     if ((piece.owner === 1 && tr === CK_SIZE - 1) || (piece.owner === 2 && tr === 0)) piece.king = true;
-    this.lastActivity = Date.now();
     const oppNum = num === 1 ? 2 : 1;
     const oppHasPieces = this.board.some(row => row.some(cell => cell && cell.owner === oppNum));
     if (!oppHasPieces || !this.hasAnyLegalMove(oppNum)) { this.status = "ended"; this.winner = num; this.broadcast(); return; }
     this.turn = oppNum;
     this.broadcast();
   }
-  hasAnyLegalMove(num) {
-    for (let r = 0; r < CK_SIZE; r++) for (let c = 0; c < CK_SIZE; c++) {
-      const piece = this.board[r][c];
-      if (!piece || piece.owner !== num) continue;
-      for (let tr = 0; tr < CK_SIZE; tr++) for (let tc = 0; tc < CK_SIZE; tc++) {
-        if (ckValidMove(this.board, num, r, c, tr, tc)) return true;
-      }
-    }
-    return false;
-  }
+  hasAnyLegalMove(num) { return ckLegalMoves(this.board, num, null).length > 0; }
   restart() {
     this.board = ckInitialBoard();
     this.turn = 1;
     this.winner = null;
+    this.chain = null;
+    this.lastMove = null;
     this.status = this.players.size === 2 ? "playing" : "waiting";
     this.lastActivity = Date.now();
     this.broadcast();
@@ -2474,7 +2539,9 @@ class CheckersRoom {
     const me = this.players.get(viewerNum);
     return {
       type: "duoState", game: "checkers", status: this.status, turn: this.turn, myNum: viewerNum, winner: this.winner,
-      board: this.board,
+      board: this.board, lastMove: this.lastMove || null,
+      chain: this.chain ? { r: this.chain.r, c: this.chain.c } : null,
+      legal: (this.status === "playing" && this.turn === viewerNum) ? ckLegalMoves(this.board, viewerNum, this.chain) : [],
       me: me ? { pseudo: me.pseudo, connected: me.connected } : null,
       opponent: opp ? { pseudo: opp.pseudo, connected: opp.connected } : null,
     };
@@ -2486,21 +2553,322 @@ class CheckersRoom {
   }
 }
 
+
+// ================= MODE DUO : NOUVEAUX JEUX (Memory, Tir à la corde, Morpion 5, Tir aux pigeons) =================
+function shuffleArr(a) { const r = a.slice(); for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; } return r; }
+class SimpleDuoRoom {
+  constructor(code, game) {
+    this.code = code;
+    this.game = game;
+    this.players = new Map();
+    this.status = "waiting";
+    this.turn = 1;
+    this.winner = null;
+    this.timer = null;
+    this.lastActivity = Date.now();
+  }
+  addPlayer(ws, pseudo) {
+    if (this.players.size >= 2) return null;
+    const num = this.players.size + 1;
+    const player = { ws, pseudo: (pseudo || `Joueur ${num}`).slice(0, 16), num, connected: true };
+    this.players.set(num, player);
+    this.lastActivity = Date.now();
+    if (this.players.size === 2) { this.status = "playing"; this.begin(); }
+    this.broadcast();
+    return player;
+  }
+  removePlayer(num) {
+    const p = this.players.get(num);
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "playing") { this.status = "ended"; this.winner = num === 1 ? 2 : 1; this.stop(); }
+    this.broadcast();
+  }
+  stop() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } }
+  begin() {}
+  end(winner) { this.stop(); this.status = "ended"; this.winner = winner; this.broadcast(); }
+  restart() {
+    this.stop();
+    this.resetState();
+    this.status = this.players.size === 2 ? "playing" : "waiting";
+    if (this.status === "playing") this.begin();
+    this.lastActivity = Date.now();
+    this.broadcast();
+  }
+  publicStateFor(viewerNum) {
+    const opp = this.players.get(viewerNum === 1 ? 2 : 1);
+    const me = this.players.get(viewerNum);
+    return Object.assign({
+      type: "duoState", game: this.game, status: this.status, turn: this.turn, myNum: viewerNum, winner: this.winner,
+      me: me ? { pseudo: me.pseudo, connected: me.connected } : null,
+      opponent: opp ? { pseudo: opp.pseudo, connected: opp.connected } : null,
+    }, this.extraState(viewerNum));
+  }
+  broadcast() {
+    for (const [num, p] of this.players.entries()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.publicStateFor(num)));
+    }
+  }
+}
+
+// ---- Memory duel ----
+const MEM_EMOJIS = ["🍎", "🍌", "🍇", "🍒", "🥝", "🍑", "🍋", "🥥", "🍓", "🍉", "🍍", "🥕"];
+class MemoryRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "memory"); this.resetState(); }
+  resetState() {
+    this.cards = shuffleArr(MEM_EMOJIS.concat(MEM_EMOJIS)).map(s => ({ s, state: "down", owner: null }));
+    this.scores = { 1: 0, 2: 0 };
+    this.turn = 1; this.winner = null; this.flipped = []; this.lock = false;
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoFlip" || this.status !== "playing" || this.turn !== num || this.lock) return;
+    const i = msg.i;
+    if (!Number.isInteger(i) || !this.cards[i] || this.cards[i].state !== "down") return;
+    this.cards[i].state = "up";
+    this.flipped.push(i);
+    if (this.flipped.length === 2) {
+      const [a, b] = this.flipped;
+      if (this.cards[a].s === this.cards[b].s) {
+        this.cards[a].state = this.cards[b].state = "matched";
+        this.cards[a].owner = this.cards[b].owner = num;
+        this.scores[num]++;
+        this.flipped = [];
+        if (this.cards.every(c => c.state === "matched")) {
+          this.end(this.scores[1] === this.scores[2] ? null : (this.scores[1] > this.scores[2] ? 1 : 2));
+          return;
+        }
+      } else {
+        this.lock = true;
+        this.timer = setTimeout(() => {
+          this.cards[a].state = "down"; this.cards[b].state = "down";
+          this.flipped = []; this.lock = false;
+          this.turn = num === 1 ? 2 : 1;
+          this.broadcast();
+        }, 1100);
+      }
+    }
+    this.broadcast();
+  }
+  extraState() {
+    return { cards: this.cards.map(c => ({ state: c.state, s: c.state === "down" ? null : c.s, owner: c.owner })), scores: this.scores, locked: this.lock };
+  }
+}
+
+// ---- Tir à la corde (temps réel) ----
+const TUG_TARGET = 25, TUG_COUNTDOWN_MS = 3000, TUG_DURATION_MS = 30000;
+class TugRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "tug"); this.resetState(); }
+  resetState() { this.pos = 0; this.winner = null; this.goAt = 0; this.endAt = 0; }
+  begin() {
+    this.goAt = Date.now() + TUG_COUNTDOWN_MS;
+    this.endAt = this.goAt + TUG_DURATION_MS;
+    this.timer = setTimeout(() => { if (this.status === "playing") this.end(this.pos > 0 ? 1 : this.pos < 0 ? 2 : null); }, TUG_COUNTDOWN_MS + TUG_DURATION_MS + 200);
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoTap" || this.status !== "playing" || Date.now() < this.goAt) return;
+    this.pos += num === 1 ? 1 : -1;
+    if (this.pos >= TUG_TARGET) { this.end(1); return; }
+    if (this.pos <= -TUG_TARGET) { this.end(2); return; }
+    this.broadcast();
+  }
+  extraState() {
+    const now = Date.now();
+    return { pos: this.pos, target: TUG_TARGET, countdownMs: Math.max(0, this.goAt - now), timeLeftMs: Math.max(0, this.endAt - now) };
+  }
+}
+
+// ---- Morpion 5 en ligne (grille 12x12) ----
+const GO_SIZE = 12;
+class GomokuRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "gomoku"); this.resetState(); }
+  resetState() {
+    this.board = Array.from({ length: GO_SIZE }, () => Array(GO_SIZE).fill(null));
+    this.turn = 1; this.winner = null; this.winLine = []; this.lastMove = null;
+  }
+  line(r, c, num) {
+    for (const [dr, dc] of [[0, 1], [1, 0], [1, 1], [1, -1]]) {
+      const cells = [[r, c]];
+      for (let s = 1; s < 5; s++) { const rr = r + dr * s, cc = c + dc * s; if (rr < 0 || rr >= GO_SIZE || cc < 0 || cc >= GO_SIZE || this.board[rr][cc] !== num) break; cells.push([rr, cc]); }
+      for (let s = 1; s < 5; s++) { const rr = r - dr * s, cc = c - dc * s; if (rr < 0 || rr >= GO_SIZE || cc < 0 || cc >= GO_SIZE || this.board[rr][cc] !== num) break; cells.push([rr, cc]); }
+      if (cells.length >= 5) return cells;
+    }
+    return null;
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoPlace" || this.status !== "playing" || this.turn !== num) return;
+    const { r, c } = msg;
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || r >= GO_SIZE || c < 0 || c >= GO_SIZE || this.board[r][c]) return;
+    this.board[r][c] = num;
+    this.lastMove = { r, c };
+    const line = this.line(r, c, num);
+    if (line) { this.winLine = line; this.end(num); return; }
+    if (this.board.every(row => row.every(x => x))) { this.end(null); return; }
+    this.turn = num === 1 ? 2 : 1;
+    this.broadcast();
+  }
+  extraState() { return { board: this.board, winLine: this.winLine, lastMove: this.lastMove, size: GO_SIZE }; }
+}
+
+// ---- Tir aux pigeons (temps réel) ----
+const PG_TOTAL = 15, PG_COUNTDOWN_MS = 3000, PG_BIRDS = ["🐦", "🕊️", "🦆", "🦅"];
+class PigeonsRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "pigeons"); this.resetState(); }
+  resetState() { this.scores = { 1: 0, 2: 0 }; this.round = 0; this.target = null; this.nextId = 1; this.lastHit = null; this.winner = null; this.goAt = 0; }
+  begin() { this.goAt = Date.now() + PG_COUNTDOWN_MS; this.timer = setTimeout(() => this.spawn(), PG_COUNTDOWN_MS); }
+  spawn() {
+    if (this.status !== "playing") return;
+    if (this.round >= PG_TOTAL) { this.end(this.scores[1] === this.scores[2] ? null : (this.scores[1] > this.scores[2] ? 1 : 2)); return; }
+    this.round++;
+    this.target = { id: this.nextId++, x: 10 + Math.random() * 80, y: 12 + Math.random() * 76, emoji: PG_BIRDS[Math.floor(Math.random() * PG_BIRDS.length)] };
+    this.broadcast();
+    const id = this.target.id;
+    this.timer = setTimeout(() => {
+      if (this.status !== "playing" || !this.target || this.target.id !== id) return;
+      this.target = null; this.lastHit = { by: 0, id };
+      this.broadcast();
+      this.timer = setTimeout(() => this.spawn(), 500);
+    }, 1800);
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoShoot" || this.status !== "playing" || !this.target || this.target.id !== msg.id) return;
+    this.scores[num]++;
+    this.lastHit = { by: num, id: this.target.id, x: this.target.x, y: this.target.y };
+    this.target = null;
+    this.stop();
+    this.broadcast();
+    this.timer = setTimeout(() => this.spawn(), 450 + Math.random() * 700);
+  }
+  extraState() { return { scores: this.scores, round: this.round, total: PG_TOTAL, target: this.target, lastHit: this.lastHit, countdownMs: Math.max(0, this.goAt - Date.now()) }; }
+}
+
+
+// ---- Bataille de mines (Duo) : traverse le terrain miné de l'adversaire, premier arrivé gagne ----
+const MN_SIZE = 6, MN_MINES = 8;
+class MinesRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "mines"); this.resetState(); }
+  resetState() {
+    this.phase = "placing"; this.turn = 1; this.winner = null; this.evN = 0; this.lastEvent = null;
+    this.pl = {};
+    for (const n of [1, 2]) this.pl[n] = { mines: [], ready: false, pawn: { r: MN_SIZE - 1, c: 2 }, revealed: [], visited: [] };
+  }
+  has(list, r, c) { return list.some(p => p[0] === r && p[1] === c); }
+  handleAct(num, msg) {
+    if (this.status !== "playing") return;
+    if (msg.type === "duoMines" && this.phase === "placing" && !this.pl[num].ready) {
+      const m = msg.mines;
+      if (!Array.isArray(m) || m.length !== MN_MINES) return;
+      const seen = [];
+      for (const p of m) {
+        if (!Array.isArray(p) || !Number.isInteger(p[0]) || !Number.isInteger(p[1])) return;
+        if (p[0] < 1 || p[0] > MN_SIZE - 2 || p[1] < 0 || p[1] >= MN_SIZE || this.has(seen, p[0], p[1])) return;
+        seen.push([p[0], p[1]]);
+      }
+      this.pl[num].mines = seen; this.pl[num].ready = true;
+      if (this.pl[1].ready && this.pl[2].ready) { this.phase = "racing"; this.turn = 1; }
+      this.broadcast();
+    } else if (msg.type === "duoStep" && this.phase === "racing" && this.turn === num) {
+      const d = { up: [-1, 0], down: [1, 0], left: [0, -1], right: [0, 1] }[msg.dir];
+      if (!d) return;
+      const me = this.pl[num], opp = this.pl[num === 1 ? 2 : 1];
+      const r = me.pawn.r + d[0], c = me.pawn.c + d[1];
+      if (r < 0 || r >= MN_SIZE || c < 0 || c >= MN_SIZE) return;
+      if (this.has(opp.mines, r, c)) {
+        if (!this.has(me.revealed, r, c)) me.revealed.push([r, c]);
+        me.pawn = { r: MN_SIZE - 1, c: 2 };
+        this.lastEvent = { type: "boom", by: num, r, c, n: ++this.evN };
+      } else {
+        me.pawn = { r, c };
+        if (!this.has(me.visited, r, c)) me.visited.push([r, c]);
+        this.lastEvent = { type: "step", by: num, r, c, n: ++this.evN };
+        if (r === 0) { this.end(num); return; }
+      }
+      this.turn = num === 1 ? 2 : 1;
+      this.broadcast();
+    }
+  }
+  extraState(v) {
+    const o = v === 1 ? 2 : 1, me = this.pl[v], op = this.pl[o];
+    return { size: MN_SIZE, phase: this.phase, mineCount: MN_MINES, lastEvent: this.lastEvent,
+      myReady: me.ready, oppReady: op.ready,
+      my: { mines: me.mines, pawn: me.pawn, revealed: me.revealed, visited: me.visited },
+      opp: { pawn: op.pawn, revealed: op.revealed } };
+  }
+}
+
+// ---- Plus ou moins (Duo) : devine le nombre secret (1-100) de l'adversaire ----
+class PlusMoinsRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "plusmoins"); this.resetState(); }
+  resetState() {
+    this.phase = "placing"; this.turn = 1; this.winner = null;
+    this.secret = { 1: null, 2: null }; this.guesses = { 1: [], 2: [] };
+  }
+  handleAct(num, msg) {
+    if (this.status !== "playing") return;
+    if (msg.type === "duoSecret" && this.phase === "placing" && this.secret[num] === null) {
+      const n = msg.n;
+      if (!Number.isInteger(n) || n < 1 || n > 100) return;
+      this.secret[num] = n;
+      if (this.secret[1] !== null && this.secret[2] !== null) { this.phase = "racing"; this.turn = 1; }
+      this.broadcast();
+    } else if (msg.type === "duoGuess" && this.phase === "racing" && this.turn === num) {
+      const n = msg.n;
+      if (!Number.isInteger(n) || n < 1 || n > 100) return;
+      const target = this.secret[num === 1 ? 2 : 1];
+      const res = n === target ? "ok" : (n < target ? "plus" : "moins");
+      this.guesses[num].push({ n, res });
+      if (res === "ok") { this.end(num); return; }
+      this.turn = num === 1 ? 2 : 1;
+      this.broadcast();
+    }
+  }
+  extraState(v) {
+    const o = v === 1 ? 2 : 1;
+    return { phase: this.phase, myReady: this.secret[v] !== null, oppReady: this.secret[o] !== null,
+      mySecret: this.secret[v], myGuesses: this.guesses[v], oppGuesses: this.guesses[o],
+      oppSecret: this.status === "ended" ? this.secret[o] : null };
+  }
+}
+
 // ---- Registre des rooms en mémoire ----
 const rooms = new Map();
 const duoRooms = new Map();
-const DUO_GAMES = ["battleship", "connect4", "rps", "checkers"];
+const DUO_GAMES = ["battleship", "connect4", "rps", "checkers", "memory", "tug", "gomoku", "pigeons", "mines", "plusmoins"];
 function getOrCreateDuoRoom(code, game) {
   code = code.toUpperCase();
   let room = duoRooms.get(code);
   if (!room) {
     const g = DUO_GAMES.includes(game) ? game : "battleship";
-    if (g === "connect4") room = new Connect4Room(code);
-    else if (g === "rps") room = new RpsRoom(code);
-    else if (g === "checkers") room = new CheckersRoom(code);
-    else room = new DuoRoom(code);
+    room = createDuoRoomOfGame(code, g);
     duoRooms.set(code, room);
   }
+  return room;
+}
+function createDuoRoomOfGame(code, g) {
+  if (g === "connect4") return new Connect4Room(code);
+  if (g === "rps") return new RpsRoom(code);
+  if (g === "checkers") return new CheckersRoom(code);
+  if (g === "memory") return new MemoryRoom(code);
+  if (g === "tug") return new TugRoom(code);
+  if (g === "gomoku") return new GomokuRoom(code);
+  if (g === "pigeons") return new PigeonsRoom(code);
+  if (g === "mines") return new MinesRoom(code);
+  if (g === "plusmoins") return new PlusMoinsRoom(code);
+  return new DuoRoom(code);
+}
+// Change de mini-jeu entre deux parties : la salle est recréée pour le nouveau jeu avec les deux mêmes joueurs.
+function switchDuoGame(oldRoom, game) {
+  if (!DUO_GAMES.includes(game) || game === oldRoom.game || oldRoom.status !== "ended") return oldRoom;
+  const p1 = oldRoom.players.get(1), p2 = oldRoom.players.get(2);
+  if (!p1 || !p2 || p1.connected === false || p2.connected === false) return oldRoom;
+  if (oldRoom.stop) oldRoom.stop();
+  const room = createDuoRoomOfGame(oldRoom.code, game);
+  room.isPublic = oldRoom.isPublic;
+  duoRooms.set(oldRoom.code, room);
+  for (const p of [p1, p2]) {
+    const np = room.addPlayer(p.ws, p.pseudo);
+    try { p.ws.send(JSON.stringify({ type: "duoWelcome", num: np.num, code: room.code, game: room.game })); } catch (e) { /* ignore */ }
+  }
+  room.broadcast();
   return room;
 }
 function getOrCreateRoom(code) {
@@ -2531,11 +2899,503 @@ const duoCleanupInterval = setInterval(() => {
   for (const [code, room] of duoRooms.entries()) {
     const connectedCount = Array.from(room.players.values()).filter(p => p.connected !== false).length;
     if (connectedCount === 0 && now - room.lastActivity > DUO_IDLE_CLEANUP_MS) {
+      if (room.stop) room.stop();
       duoRooms.delete(code);
     }
   }
 }, 1000 * 60 * 10);
 duoCleanupInterval.unref();
+
+
+// ================= MODE MULTI : JEUX DE SOCIÉTÉ À PLUSIEURS (2 à 8 joueurs) =================
+const PARTY_MAX = 8;
+const PARTY_GAMES = ["simon", "potato", "stop10", "memory", "taps", "vote"];
+const partyRooms = new Map();
+
+// ---- Simon : chacun son tour rejoue toute la séquence puis ajoute une couleur ----
+class SimonParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "simon";
+    this.alive = ids.slice(); this.eliminated = [];
+    this.seq = []; this.turnIdx = 0; this.phase = "show"; this.input = 0; this.showId = 0;
+    this.lastTap = null; this.lastEvent = null; this.timer = null; this.tapN = 0; this.evN = 0;
+  }
+  cur() { return this.alive[this.turnIdx % this.alive.length]; }
+  start() { this.beginTurn(); }
+  stop() { clearTimeout(this.timer); clearTimeout(this.tTimer); }
+  beginTurn() {
+    this.stop();
+    this.input = 0;
+    if (this.seq.length === 0) { this.phase = "input"; this.armTimeout(); }
+    else {
+      this.phase = "show"; this.showId++;
+      this.timer = setTimeout(() => { this.phase = "input"; this.input = 0; this.armTimeout(); this.room.broadcast(); }, this.seq.length * 650 + 900);
+    }
+    this.room.broadcast();
+  }
+  armTimeout() { clearTimeout(this.tTimer); this.tTimer = setTimeout(() => this.fail(this.cur()), 12000); }
+  act(id, msg) {
+    if (msg.type !== "simonTap" || this.phase !== "input" || id !== this.cur()) return;
+    const pad = msg.pad;
+    if (!Number.isInteger(pad) || pad < 0 || pad > 3) return;
+    this.tapN++;
+    this.lastTap = { id, pad, n: this.tapN };
+    if (this.input < this.seq.length) {
+      if (pad !== this.seq[this.input]) { this.fail(id); return; }
+      this.input++;
+      this.armTimeout();
+      this.room.broadcast();
+    } else {
+      this.seq.push(pad);
+      this.lastEvent = { type: "added", id, n: ++this.evN };
+      this.turnIdx = (this.alive.indexOf(id) + 1) % this.alive.length;
+      this.beginTurn();
+    }
+  }
+  fail(id) {
+    const idx = this.alive.indexOf(id);
+    if (idx < 0) return;
+    this.alive.splice(idx, 1); this.eliminated.push(id);
+    this.lastEvent = { type: "out", id, n: ++this.evN };
+    if (this.alive.length <= 1) { this.stop(); this.room.finish(this.alive[0] || null); return; }
+    this.turnIdx = idx % this.alive.length;
+    this.beginTurn();
+  }
+  onLeave(id) {
+    if (!this.alive.includes(id)) return;
+    if (id === this.cur()) { this.fail(id); return; }
+    const idx = this.alive.indexOf(id), curId = this.cur();
+    this.alive.splice(idx, 1); this.eliminated.push(id);
+    this.turnIdx = this.alive.indexOf(curId);
+    if (this.alive.length <= 1) { this.stop(); this.room.finish(this.alive[0] || null); return; }
+    this.room.broadcast();
+  }
+  state() {
+    return { game: "simon", phase: this.phase, turnId: this.cur(), seqLen: this.seq.length, seq: this.phase === "show" ? this.seq : null,
+      showId: this.showId, input: this.input, alive: this.alive, eliminated: this.eliminated, lastTap: this.lastTap, lastEvent: this.lastEvent };
+  }
+}
+
+// ---- Patate chaude : la patate explose entre les mains de quelqu'un ----
+class PotatoParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "potato";
+    this.alive = ids.slice(); this.eliminated = [];
+    this.holder = null; this.passes = 0; this.lastPass = null; this.lastEvent = null; this.timer = null; this.boomN = 0;
+  }
+  start() { this.holder = this.alive[Math.floor(Math.random() * this.alive.length)]; this.arm(); this.room.broadcast(); }
+  stop() { clearTimeout(this.timer); }
+  arm() { clearTimeout(this.timer); this.timer = setTimeout(() => this.boom(), 6000 + Math.random() * 12000); }
+  act(id, msg) {
+    if (msg.type !== "potatoPass" || id !== this.holder) return;
+    const to = msg.to;
+    if (!this.alive.includes(to) || to === id) return;
+    this.holder = to; this.passes++;
+    this.lastPass = { from: id, to, n: this.passes };
+    this.room.broadcast();
+  }
+  boom() {
+    const out = this.holder;
+    this.removeAlive(out);
+    this.boomN++;
+    this.lastEvent = { type: "boom", id: out, n: this.boomN };
+    if (this.alive.length <= 1) { this.stop(); this.room.finish(this.alive[0] || null); return; }
+    this.holder = this.alive[Math.floor(Math.random() * this.alive.length)];
+    this.arm();
+    this.room.broadcast();
+  }
+  removeAlive(id) { const i = this.alive.indexOf(id); if (i >= 0) { this.alive.splice(i, 1); this.eliminated.push(id); } }
+  onLeave(id) {
+    if (!this.alive.includes(id)) return;
+    if (id === this.holder) { this.boom(); return; }
+    this.removeAlive(id);
+    if (this.alive.length <= 1) { this.stop(); this.room.finish(this.alive[0] || null); return; }
+    this.room.broadcast();
+  }
+  state() { return { game: "potato", holderId: this.holder, alive: this.alive, eliminated: this.eliminated, lastPass: this.lastPass, lastEvent: this.lastEvent }; }
+}
+
+
+// ---- Stop à 10 : appuie pile à 10,00 s sans voir le compteur (3 manches) ----
+class StopParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "stop10";
+    this.ids = ids.slice(); this.left = [];
+    this.round = 0; this.rounds = 3;
+    this.totals = {}; ids.forEach(i => { this.totals[i] = 0; });
+    this.phase = "countdown"; this.tapped = {}; this.errors = {};
+    this.startAt = 0; this.countdownEnds = 0; this.timer = null; this.ranking = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  start() { this.nextRound(); }
+  stop() { clearTimeout(this.timer); }
+  nextRound() {
+    this.round++; this.phase = "countdown"; this.tapped = {}; this.errors = {};
+    this.countdownEnds = Date.now() + 3000;
+    this.room.broadcast();
+    this.timer = setTimeout(() => {
+      this.phase = "running"; this.startAt = Date.now();
+      this.room.broadcast();
+      this.timer = setTimeout(() => this.endRound(), 13000);
+    }, 3000);
+  }
+  act(id, msg) {
+    if (msg.type !== "stopTap" || this.phase !== "running" || this.tapped[id] || this.left.includes(id) || !this.ids.includes(id)) return;
+    this.tapped[id] = true;
+    this.errors[id] = Math.abs(Date.now() - this.startAt - 10000);
+    if (this.active().every(i => this.tapped[i])) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  endRound() {
+    for (const id of this.ids) {
+      if (this.errors[id] === undefined) this.errors[id] = 5000;
+      this.totals[id] += this.errors[id];
+    }
+    this.phase = "results";
+    this.room.broadcast();
+    this.timer = setTimeout(() => { if (this.round >= this.rounds) this.finishAll(); else this.nextRound(); }, 4500);
+  }
+  finishAll() {
+    const act = this.active();
+    this.ranking = this.ids.slice().sort((a, b) => this.totals[a] - this.totals[b]).map(id => ({ id, score: this.totals[id], left: this.left.includes(id) }));
+    const best = this.ranking.find(r => !r.left);
+    this.room.finish(best ? best.id : null);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    const act = this.active();
+    if (act.length <= 1) { this.stop(); this.finishAll(); return; }
+    if (this.phase === "running" && act.every(i => this.tapped[i])) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  state() {
+    const now = Date.now();
+    return { game: "stop10", phase: this.phase, round: this.round, rounds: this.rounds,
+      elapsedMs: this.phase === "running" ? now - this.startAt : 0, countdownMs: this.phase === "countdown" ? Math.max(0, this.countdownEnds - now) : 0,
+      tapped: this.tapped, errors: this.phase === "results" || this.ranking ? this.errors : null, totals: this.phase === "results" || this.ranking ? this.totals : null,
+      left: this.left, ranking: this.ranking };
+  }
+}
+
+// ---- Memory à plusieurs : même plateau, chacun son tour ----
+const PARTY_MEM_EMOJIS = MEM_EMOJIS.concat(["🍐", "🥑", "🍔"]);
+class MemoryParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "memory";
+    this.ids = ids.slice(); this.left = [];
+    this.cards = shuffleArr(PARTY_MEM_EMOJIS.concat(PARTY_MEM_EMOJIS)).map(s => ({ s, state: "down", owner: null }));
+    this.scores = {}; ids.forEach(i => { this.scores[i] = 0; });
+    this.turnIdx = 0; this.flipped = []; this.lock = false; this.timer = null; this.ranking = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  cur() { const a = this.active(); return a[this.turnIdx % a.length]; }
+  start() { this.room.broadcast(); }
+  stop() { clearTimeout(this.timer); }
+  nextTurn() { this.flipped = []; this.lock = false; const a = this.active(); const i = a.indexOf(this.cur()); this.turnIdx = (i + 1) % a.length; }
+  act(id, msg) {
+    if (msg.type !== "memFlip" || id !== this.cur() || this.lock) return;
+    const i = msg.i;
+    if (!Number.isInteger(i) || !this.cards[i] || this.cards[i].state !== "down") return;
+    this.cards[i].state = "up"; this.flipped.push(i);
+    if (this.flipped.length === 2) {
+      const [a, b] = this.flipped;
+      if (this.cards[a].s === this.cards[b].s) {
+        this.cards[a].state = this.cards[b].state = "matched";
+        this.cards[a].owner = this.cards[b].owner = id;
+        this.scores[id]++; this.flipped = [];
+        if (this.cards.every(c => c.state === "matched")) { this.finishAll(); return; }
+      } else {
+        this.lock = true;
+        this.timer = setTimeout(() => {
+          this.cards[a].state = "down"; this.cards[b].state = "down";
+          this.nextTurn(); this.room.broadcast();
+        }, 1200);
+      }
+    }
+    this.room.broadcast();
+  }
+  finishAll() {
+    this.ranking = this.ids.slice().sort((a, b) => this.scores[b] - this.scores[a]).map(id => ({ id, score: this.scores[id], left: this.left.includes(id) }));
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score;
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    const wasCur = this.cur() === id;
+    this.left.push(id);
+    const act = this.active();
+    if (act.length <= 1) { this.stop(); this.finishAll(); return; }
+    if (wasCur) {
+      clearTimeout(this.timer);
+      this.flipped.forEach(i => { if (this.cards[i].state === "up") this.cards[i].state = "down"; });
+      this.flipped = []; this.lock = false;
+      this.turnIdx = this.turnIdx % act.length;
+    } else {
+      this.turnIdx = this.active().indexOf(this.cur());
+      if (this.turnIdx < 0) this.turnIdx = 0;
+    }
+    this.room.broadcast();
+  }
+  state() {
+    return { game: "memory", turnId: this.cur(), locked: this.lock, scores: this.scores, left: this.left, ranking: this.ranking,
+      cards: this.cards.map(c => ({ state: c.state, s: c.state === "down" ? null : c.s, owner: c.owner })) };
+  }
+}
+
+// ---- Course de taps : 10 secondes pour taper le plus possible ----
+class TapsParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "taps";
+    this.ids = ids.slice(); this.left = [];
+    this.counts = {}; this.last = {}; ids.forEach(i => { this.counts[i] = 0; this.last[i] = 0; });
+    this.phase = "countdown"; this.goAt = 0; this.endAt = 0; this.timer = null; this.tick = null; this.dirty = false; this.ranking = null;
+  }
+  start() {
+    this.goAt = Date.now() + 3000; this.endAt = this.goAt + 10000;
+    this.room.broadcast();
+    this.timer = setTimeout(() => {
+      this.phase = "running";
+      this.room.broadcast();
+      this.tick = setInterval(() => { if (this.dirty) { this.dirty = false; this.room.broadcast(); } }, 150);
+      this.timer = setTimeout(() => this.finishAll(), 10000);
+    }, 3000);
+  }
+  stop() { clearTimeout(this.timer); clearInterval(this.tick); }
+  act(id, msg) {
+    if (msg.type !== "tapTap" || this.phase !== "running" || !this.ids.includes(id) || this.left.includes(id)) return;
+    const now = Date.now();
+    if (now - this.last[id] < 35) return; // anti-spam : ~28 taps/s max
+    this.last[id] = now; this.counts[id]++; this.dirty = true;
+  }
+  finishAll() {
+    this.stop(); this.phase = "ended";
+    this.ranking = this.ids.slice().sort((a, b) => this.counts[b] - this.counts[a]).map(id => ({ id, score: this.counts[id], left: this.left.includes(id) }));
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score;
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    if (this.ids.filter(i => !this.left.includes(i)).length <= 1) { this.finishAll(); return; }
+    this.room.broadcast();
+  }
+  state() {
+    const now = Date.now();
+    return { game: "taps", phase: this.phase, countdownMs: this.phase === "countdown" ? Math.max(0, this.goAt - now) : 0,
+      timeLeftMs: this.phase === "running" ? Math.max(0, this.endAt - now) : (this.phase === "ended" ? 0 : 10000),
+      counts: this.counts, left: this.left, ranking: this.ranking };
+  }
+}
+
+
+// ---- Vote du plus… : questions fun, chacun vote pour un joueur ----
+const VOTE_QUESTIONS = [
+  "Qui est le plus susceptible d'arriver en retard à son propre mariage ?",
+  "Qui est le plus susceptible de survivre dans la jungle ?",
+  "Qui est le plus susceptible de devenir célèbre ?",
+  "Qui est le plus susceptible de s'endormir pendant un film ?",
+  "Qui est le plus susceptible de perdre ses clés ?",
+  "Qui est le plus susceptible de gagner au loto et tout dépenser en une semaine ?",
+  "Qui est le plus susceptible d'oublier un anniversaire ?",
+  "Qui est le plus susceptible de rire au pire moment ?",
+  "Qui est le plus susceptible de pleurer devant un dessin animé ?",
+  "Qui est le plus susceptible de parler tout seul ?",
+  "Qui est le plus susceptible de tout planifier dans les moindres détails ?",
+  "Qui est le plus susceptible de se perdre avec un GPS ?",
+  "Qui est le plus susceptible de manger le dernier morceau de gâteau sans demander ?",
+  "Qui est le plus susceptible de devenir milliardaire ?",
+  "Qui est le plus susceptible de partir vivre à l'étranger sur un coup de tête ?",
+  "Qui est le plus susceptible de gagner une partie d'échecs ?",
+  "Qui est le plus susceptible de rester calme en cas de catastrophe ?",
+  "Qui est le plus susceptible de paniquer pour rien ?",
+  "Qui est le plus susceptible de dire la vérité même si ça fait mal ?",
+  "Qui est le plus susceptible de mentir avec un grand sourire ?",
+  "Qui est le plus susceptible de rater son train ?",
+  "Qui est le plus susceptible d'adopter 10 chats ?",
+  "Qui est le plus susceptible de commencer un régime et d'abandonner le lendemain ?",
+  "Qui est le plus susceptible de chanter sous la douche à tue-tête ?",
+  "Qui est le plus susceptible de devenir président(e) ?",
+  "Qui est le plus susceptible d'inventer quelque chose d'utile ?",
+  "Qui est le plus susceptible de se faire un tatouage sur un coup de tête ?",
+  "Qui est le plus susceptible de rester au lit toute la journée ?",
+  "Qui est le plus susceptible de tricher aux jeux de société ?",
+  "Qui est le plus susceptible de faire le tour du monde ?",
+  "Qui est le plus susceptible de rater un examen à cause d'un oubli ?",
+  "Qui est le plus susceptible de répondre « je suis presque arrivé » alors qu'il n'est pas parti ?",
+  "Qui est le plus susceptible de tomber amoureux en une semaine ?",
+  "Qui est le plus susceptible de faire un discours improvisé de 20 minutes ?",
+  "Qui est le plus susceptible de casser son téléphone ?",
+  "Qui est le plus susceptible de gagner un concours de danse ?",
+  "Qui est le plus susceptible de devenir un grand chef cuisinier ?",
+  "Qui est le plus susceptible de se déguiser sans raison ?",
+  "Qui est le plus susceptible de lire tout un livre en une nuit ?",
+  "Qui est le plus susceptible d'avoir peur d'une petite araignée ?",
+  "Qui est le plus susceptible de répondre à un message trois jours plus tard ?",
+  "Qui est le plus susceptible de gagner à un jeu vidéo sans s'entraîner ?",
+  "Qui est le plus susceptible de faire un câlin à un inconnu ?",
+  "Qui est le plus susceptible de dépenser tout son argent en une soirée ?",
+  "Qui est le plus susceptible de devenir une star de cinéma ?",
+  "Qui est le plus susceptible de se réveiller avant le réveil ?",
+  "Qui est le plus susceptible de dire « j'ai tout compris » sans avoir rien compris ?",
+];
+const VOTE_ROUNDS = 8, VOTE_TIME_MS = 25000, VOTE_RESULT_MS = 6000;
+class VoteParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "vote";
+    this.ids = ids.slice(); this.left = [];
+    this.totals = {}; ids.forEach(i => { this.totals[i] = 0; });
+    this.questions = shuffleArr(VOTE_QUESTIONS).slice(0, VOTE_ROUNDS);
+    this.round = 0; this.phase = "voting"; this.votes = {}; this.voteEnds = 0; this.timer = null; this.ranking = null; this.roundCounts = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  start() { this.nextRound(); }
+  stop() { clearTimeout(this.timer); }
+  nextRound() {
+    this.round++; this.phase = "voting"; this.votes = {}; this.roundCounts = null;
+    this.voteEnds = Date.now() + VOTE_TIME_MS;
+    this.room.broadcast();
+    this.timer = setTimeout(() => this.endRound(), VOTE_TIME_MS);
+  }
+  act(id, msg) {
+    if (msg.type !== "voteFor" || this.phase !== "voting" || this.left.includes(id) || !this.ids.includes(id) || this.votes[id] !== undefined) return;
+    const to = msg.to;
+    if (!this.ids.includes(to) || to === id || this.left.includes(to)) return;
+    this.votes[id] = to;
+    if (this.active().every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  endRound() {
+    this.roundCounts = {};
+    this.ids.forEach(i => { this.roundCounts[i] = 0; });
+    Object.values(this.votes).forEach(to => { this.roundCounts[to]++; this.totals[to]++; });
+    this.phase = "results";
+    this.room.broadcast();
+    this.timer = setTimeout(() => { if (this.round >= this.questions.length) this.finishAll(); else this.nextRound(); }, VOTE_RESULT_MS);
+  }
+  finishAll() {
+    this.ranking = this.ids.slice().sort((a, b) => this.totals[b] - this.totals[a]).map(id => ({ id, score: this.totals[id], left: this.left.includes(id) }));
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score;
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    const act = this.active();
+    if (act.length <= 1) { this.stop(); this.finishAll(); return; }
+    if (this.phase === "voting" && act.every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  state() {
+    const showRes = this.phase === "results" || !!this.ranking;
+    const voted = {}; Object.keys(this.votes).forEach(k => { voted[k] = true; });
+    return { game: "vote", phase: this.phase, round: this.round, rounds: this.questions.length, question: this.questions[Math.max(0, this.round - 1)],
+      timeLeftMs: this.phase === "voting" ? Math.max(0, this.voteEnds - Date.now()) : 0, voted, left: this.left,
+      roundCounts: showRes ? this.roundCounts : null, totals: showRes ? this.totals : null, ranking: this.ranking };
+  }
+}
+
+class PartyRoom {
+  constructor(code) {
+    this.code = code;
+    this.players = new Map(); // id -> {id, ws, pseudo, connected}
+    this.nextId = 1;
+    this.hostId = null;
+    this.status = "lobby"; // lobby -> playing -> ended
+    this.selectedGame = "simon";
+    this.g = null;
+    this.winnerId = null;
+    this.lastActivity = Date.now();
+  }
+  connectedPlayers() { return Array.from(this.players.values()).filter(p => p.connected); }
+  addPlayer(ws, pseudo) {
+    if (this.status !== "lobby") return { error: "La partie a déjà commencé." };
+    if (this.players.size >= PARTY_MAX) return { error: "Le salon est plein." };
+    const id = this.nextId++;
+    const player = { id, ws, pseudo: (pseudo || `Joueur ${id}`).slice(0, 16), connected: true };
+    this.players.set(id, player);
+    if (this.hostId === null) this.hostId = id;
+    this.lastActivity = Date.now();
+    this.broadcast();
+    return { player };
+  }
+  removePlayer(id) {
+    const p = this.players.get(id);
+    if (!p) return;
+    p.connected = false;
+    if (this.status === "lobby") this.players.delete(id);
+    if (this.hostId === id) {
+      const next = this.connectedPlayers()[0];
+      this.hostId = next ? next.id : null;
+    }
+    if (this.status === "playing" && this.g) this.g.onLeave(id);
+    if (this.connectedPlayers().length === 0 && this.g) { this.g.stop(); this.g = null; }
+    this.broadcast();
+  }
+  handle(id, msg) {
+    this.lastActivity = Date.now();
+    if (msg.type === "partySelect" && id === this.hostId && this.status === "lobby" && PARTY_GAMES.includes(msg.game)) {
+      this.selectedGame = msg.game; this.broadcast();
+    } else if (msg.type === "partyStart" && id === this.hostId && (this.status === "lobby" || this.status === "ended")) {
+      this.startGame();
+    } else if (msg.type === "partyBack" && id === this.hostId && this.status === "ended") {
+      for (const [pid, p] of this.players) if (!p.connected) this.players.delete(pid);
+      this.status = "lobby"; this.g = null; this.winnerId = null; this.broadcast();
+    } else if (msg.type === "partyAct" && this.status === "playing" && this.g) {
+      this.g.act(id, Object.assign({}, msg, { type: msg.act }));
+    }
+  }
+  startGame() {
+    const ids = this.connectedPlayers().map(p => p.id);
+    if (ids.length < 2) {
+      const host = this.players.get(this.hostId);
+      if (host && host.ws && host.ws.readyState === 1) host.ws.send(JSON.stringify({ type: "partyError", message: "Il faut au moins 2 joueurs pour démarrer." }));
+      return;
+    }
+    for (const [pid, p] of this.players) if (!p.connected) this.players.delete(pid);
+    if (this.g) this.g.stop();
+    this.winnerId = null;
+    this.status = "playing";
+    const GameCls = { simon: SimonParty, potato: PotatoParty, stop10: StopParty, memory: MemoryParty, taps: TapsParty, vote: VoteParty }[this.selectedGame] || SimonParty;
+    this.g = new GameCls(this, ids);
+    this.g.start();
+    this.broadcast();
+  }
+  finish(winnerId) {
+    if (this.g) this.g.stop();
+    this.status = "ended"; this.winnerId = winnerId;
+    this.broadcast();
+  }
+  stateFor(viewerId) {
+    return {
+      type: "partyState", code: this.code, status: this.status, hostId: this.hostId, myId: viewerId,
+      selectedGame: this.selectedGame, winnerId: this.winnerId,
+      players: Array.from(this.players.values()).map(p => ({ id: p.id, pseudo: p.pseudo, connected: p.connected })),
+      game: this.status !== "lobby" && this.g ? this.g.state() : null,
+    };
+  }
+  broadcast() {
+    for (const p of this.players.values()) {
+      if (p.ws && p.ws.readyState === 1) p.ws.send(JSON.stringify(this.stateFor(p.id)));
+    }
+  }
+}
+function getOrCreatePartyRoom(code) {
+  code = code.toUpperCase();
+  let room = partyRooms.get(code);
+  if (!room) { room = new PartyRoom(code); partyRooms.set(code, room); }
+  return room;
+}
+const partyCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of partyRooms.entries()) {
+    if (room.connectedPlayers().length === 0 && now - room.lastActivity > DUO_IDLE_CLEANUP_MS) {
+      if (room.g) room.g.stop();
+      partyRooms.delete(code);
+    }
+  }
+}, 1000 * 60 * 10);
+partyCleanupInterval.unref();
 
 // ---- Serveur HTTP + WebSocket ----
 const server = http.createServer((req, res) => {
@@ -2553,10 +3413,32 @@ const server = http.createServer((req, res) => {
       let parsed = {};
       try { parsed = JSON.parse(body || "{}"); } catch (e) { /* ignore */ }
       const code = genCode();
-      getOrCreateDuoRoom(code, parsed.game);
+      const duoNew = getOrCreateDuoRoom(code, parsed.game);
+      duoNew.isPublic = !!parsed.isPublic;
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ code }));
     });
+    return;
+  }
+
+  if (url.pathname === "/api/duo-public-rooms" && req.method === "GET") {
+    const list = [];
+    for (const room of duoRooms.values()) {
+      const host = room.players.get(1);
+      if (room.isPublic && room.status === "waiting" && room.players.size === 1 && host && host.connected !== false) {
+        list.push({ code: room.code, game: room.game, hostPseudo: host.pseudo || "?" });
+      }
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(list));
+    return;
+  }
+
+  if (url.pathname === "/api/party-create" && req.method === "POST") {
+    const code = genCode();
+    getOrCreatePartyRoom(code);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ code }));
     return;
   }
 
@@ -2620,18 +3502,36 @@ server.on("upgrade", (req, socket, head) => {
     const pseudo = (url.searchParams.get("pseudo") || "Joueur").slice(0, 16);
     if (!code) { ws.close(1008, "code manquant"); return; }
 
-    if (url.searchParams.get("duo") === "1") {
-      const game = url.searchParams.get("game");
-      const duoRoom = getOrCreateDuoRoom(code, game);
-      const player = duoRoom.addPlayer(ws, pseudo);
-      if (!player) { ws.send(JSON.stringify({ type: "error", message: "Cette partie Duo est déjà pleine." })); ws.close(1008, "full"); return; }
-      ws.send(JSON.stringify({ type: "duoWelcome", num: player.num, code: duoRoom.code, game: duoRoom.game }));
-      duoRoom.broadcast();
+    if (url.searchParams.get("party") === "1") {
+      const partyRoom = getOrCreatePartyRoom(code);
+      const res2 = partyRoom.addPlayer(ws, pseudo);
+      if (res2.error) { ws.send(JSON.stringify({ type: "error", message: res2.error })); ws.close(1008, "refused"); return; }
+      const pl = res2.player;
       ws.on("message", (raw) => {
         let msg;
         try { msg = JSON.parse(raw); } catch (e) { return; }
+        partyRoom.handle(pl.id, msg);
+      });
+      ws.on("close", () => { partyRoom.removePlayer(pl.id); });
+      return;
+    }
+
+    if (url.searchParams.get("duo") === "1") {
+      const game = url.searchParams.get("game");
+      const initialRoom = getOrCreateDuoRoom(code, game);
+      const player = initialRoom.addPlayer(ws, pseudo);
+      if (!player) { ws.send(JSON.stringify({ type: "error", message: "Cette partie Duo est déjà pleine." })); ws.close(1008, "full"); return; }
+      ws.send(JSON.stringify({ type: "duoWelcome", num: player.num, code: initialRoom.code, game: initialRoom.game }));
+      initialRoom.broadcast();
+      ws.on("message", (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw); } catch (e) { return; }
+        let duoRoom = duoRooms.get(code.toUpperCase());
+        if (!duoRoom) return;
         duoRoom.lastActivity = Date.now();
+        if (msg.type === "duoChangeGame") { switchDuoGame(duoRoom, msg.game); return; }
         if (msg.type === "duoRestart" && duoRoom.status === "ended") { duoRoom.restart(); return; }
+        if (typeof duoRoom.handleAct === "function") { duoRoom.handleAct(player.num, msg); return; }
         if (duoRoom.game === "battleship") {
           if (msg.type === "duoPlace") duoRoom.handlePlace(player.num, msg.ships);
           else if (msg.type === "duoFire") duoRoom.handleFire(player.num, msg.r, msg.c);
@@ -2643,7 +3543,10 @@ server.on("upgrade", (req, socket, head) => {
           if (msg.type === "duoMove") duoRoom.handleMove(player.num, msg.fr, msg.fc, msg.tr, msg.tc);
         }
       });
-      ws.on("close", () => { duoRoom.removePlayer(player.num); });
+      ws.on("close", () => {
+        const cur = duoRooms.get(code.toUpperCase());
+        if (cur && cur.players.get(player.num) && cur.players.get(player.num).ws === ws) cur.removePlayer(player.num);
+      });
       return;
     }
 
@@ -2670,7 +3573,11 @@ server.on("upgrade", (req, socket, head) => {
       const p = room.players[player.id];
       if (!p) return;
       if (msg.type === "start" && player.id === room.hostId && (room.status === "lobby" || room.status === "ended")) {
-        room.start(msg.mode, msg.config);
+        if (Object.keys(room.players).length < 2) {
+          ws.send(JSON.stringify({ type: "startRefused", message: "Il faut au moins 2 joueurs (ou des bots de remplissage) pour démarrer." }));
+        } else {
+          room.start(msg.mode, msg.config);
+        }
       } else if (msg.type === "move" && room.status === "playing") {
         room.handleMove(p, msg);
       } else if (msg.type === "attack" && room.status === "playing") {
