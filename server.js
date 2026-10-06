@@ -3036,10 +3036,51 @@ class HangmanRoom extends SimpleDuoRoom {
   }
 }
 
+
+// ---- Reversi (Othello) 8x8 : J1 noir, J2 blanc ----
+class ReversiRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "reversi"); this.resetState(); }
+  resetState() {
+    const b = Array.from({ length: 8 }, () => Array(8).fill(0));
+    b[3][3] = 2; b[4][4] = 2; b[3][4] = 1; b[4][3] = 1;
+    this.board = b; this.turn = 1; this.winner = null; this.last = null; this.passed = null;
+  }
+  flips(num, r, c) {
+    if (this.board[r][c]) return [];
+    const opp = num === 1 ? 2 : 1, out = [];
+    for (const [dr, dc] of [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]) {
+      const line = []; let y = r + dr, x = c + dc;
+      while (y >= 0 && y < 8 && x >= 0 && x < 8 && this.board[y][x] === opp) { line.push([y, x]); y += dr; x += dc; }
+      if (line.length && y >= 0 && y < 8 && x >= 0 && x < 8 && this.board[y][x] === num) out.push(...line);
+    }
+    return out;
+  }
+  legal(num) {
+    const l = [];
+    for (let r = 0; r < 8; r++) for (let c = 0; c < 8; c++) if (this.flips(num, r, c).length) l.push([r, c]);
+    return l;
+  }
+  counts() { const n = { 1: 0, 2: 0 }; this.board.forEach(row => row.forEach(v => { if (v) n[v]++; })); return n; }
+  handleAct(num, msg) {
+    if (msg.type !== "duoReversi" || this.status !== "playing" || this.turn !== num) return;
+    const r = msg.r, c = msg.c;
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || c < 0 || r > 7 || c > 7) return;
+    const f = this.flips(num, r, c); if (!f.length) return;
+    this.board[r][c] = num; f.forEach(([y, x]) => { this.board[y][x] = num; });
+    this.last = [r, c]; this.passed = null;
+    const opp = num === 1 ? 2 : 1;
+    if (this.legal(opp).length) this.turn = opp;
+    else if (this.legal(num).length) { this.passed = opp; this.turn = num; }
+    else { const n = this.counts(); this.end(n[1] === n[2] ? null : (n[1] > n[2] ? 1 : 2)); return; }
+    this.broadcast();
+  }
+  extraState(v) { return { board: this.board, last: this.last, passed: this.passed, counts: this.counts(), legal: this.status === "playing" && this.turn === v ? this.legal(v) : [] }; }
+}
+
 // ---- Registre des rooms en mémoire ----
 const rooms = new Map();
 const duoRooms = new Map();
-const DUO_GAMES = ["battleship", "connect4", "rps", "checkers", "memory", "tug", "gomoku", "pigeons", "mines", "plusmoins", "hex", "dice", "pong", "maths", "hangman"];
+const DUO_GAMES = ["battleship", "connect4", "rps", "checkers", "memory", "tug", "gomoku", "pigeons", "mines", "plusmoins", "hex", "dice", "pong", "maths", "hangman", "reversi"];
 function getOrCreateDuoRoom(code, game) {
   code = code.toUpperCase();
   let room = duoRooms.get(code);
@@ -3065,6 +3106,7 @@ function createDuoRoomOfGame(code, g) {
   if (g === "pong") return new PongRoom(code);
   if (g === "maths") return new MathRoom(code);
   if (g === "hangman") return new HangmanRoom(code);
+  if (g === "reversi") return new ReversiRoom(code);
   return new DuoRoom(code);
 }
 // Change de mini-jeu entre deux parties : la salle est recréée pour le nouveau jeu avec les deux mêmes joueurs.
