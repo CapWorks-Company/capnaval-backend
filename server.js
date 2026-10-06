@@ -2829,10 +2829,217 @@ class PlusMoinsRoom extends SimpleDuoRoom {
   }
 }
 
+// ======================= NOUVEAUX JEUX DUO (2) =======================
+// ---- Hex (9x9) : J1 relie haut-bas, J2 relie gauche-droite ----
+const HEX_N = 9;
+class HexRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "hex"); this.resetState(); }
+  resetState() { this.board = Array.from({ length: HEX_N }, () => Array(HEX_N).fill(0)); this.turn = 1; this.winner = null; this.last = null; this.path = null; }
+  handleAct(num, msg) {
+    if (msg.type !== "duoHex" || this.status !== "playing" || this.turn !== num) return;
+    const r = msg.r, c = msg.c;
+    if (!Number.isInteger(r) || !Number.isInteger(c) || r < 0 || c < 0 || r >= HEX_N || c >= HEX_N || this.board[r][c]) return;
+    this.board[r][c] = num; this.last = [r, c];
+    const path = this.findPath(num);
+    if (path) { this.path = path; this.end(num); return; }
+    this.turn = num === 1 ? 2 : 1;
+    this.broadcast();
+  }
+  findPath(p) {
+    const N = HEX_N, prev = new Map(), q = [];
+    for (let i = 0; i < N; i++) { const r = p === 1 ? 0 : i, c = p === 1 ? i : 0; if (this.board[r][c] === p) { q.push([r, c]); prev.set(r + "," + c, null); } }
+    const D = [[-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0]];
+    while (q.length) {
+      const [r, c] = q.shift();
+      if ((p === 1 && r === N - 1) || (p === 2 && c === N - 1)) {
+        const path = []; let k = r + "," + c;
+        while (k) { path.push(k.split(",").map(Number)); k = prev.get(k); }
+        return path;
+      }
+      for (const [dr, dc] of D) {
+        const nr = r + dr, nc = c + dc;
+        if (nr < 0 || nc < 0 || nr >= N || nc >= N || this.board[nr][nc] !== p) continue;
+        const key = nr + "," + nc; if (prev.has(key)) continue;
+        prev.set(key, r + "," + c); q.push([nr, nc]);
+      }
+    }
+    return null;
+  }
+  extraState() { return { n: HEX_N, board: this.board, last: this.last, path: this.path }; }
+}
+
+// ---- Dés menteurs : 5 dés chacun, annonce ou "Menteur !" ----
+class DiceRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "dice"); this.resetState(); }
+  resetState() { this.count = { 1: 5, 2: 5 }; this.round = 0; this.winner = null; this.starter = 1; this.rollDice(); this.turn = this.starter; }
+  rollDice() {
+    this.round++; this.dice = {};
+    for (const n of [1, 2]) this.dice[n] = Array.from({ length: this.count[n] }, () => 1 + Math.floor(Math.random() * 6));
+    this.bid = null; this.phase = "bidding"; this.reveal = null;
+  }
+  handleAct(num, msg) {
+    if (this.status !== "playing" || this.phase !== "bidding" || this.turn !== num) return;
+    if (msg.type === "duoBid") {
+      const q = msg.q, f = msg.f;
+      if (!Number.isInteger(q) || !Number.isInteger(f) || f < 1 || f > 6 || q < 1 || q > this.count[1] + this.count[2]) return;
+      if (this.bid && !(q > this.bid.q || (q === this.bid.q && f > this.bid.f))) return;
+      this.bid = { q, f, by: num }; this.turn = num === 1 ? 2 : 1; this.broadcast();
+    } else if (msg.type === "duoLiar" && this.bid) {
+      const total = this.dice[1].concat(this.dice[2]).filter(d => d === this.bid.f).length;
+      const loser = total >= this.bid.q ? num : this.bid.by;
+      this.count[loser]--; this.phase = "reveal";
+      this.reveal = { total, loser, caller: num, bid: this.bid, dice: { 1: this.dice[1].slice(), 2: this.dice[2].slice() } };
+      this.broadcast();
+      this.timer = setTimeout(() => {
+        if (this.status !== "playing") return;
+        if (this.count[loser] <= 0) { this.end(loser === 1 ? 2 : 1); return; }
+        this.starter = loser; this.rollDice(); this.turn = loser; this.broadcast();
+      }, 4500);
+    }
+  }
+  extraState(v) {
+    const o = v === 1 ? 2 : 1, rev = this.phase === "reveal";
+    return { phase: this.phase, round: this.round, bid: this.bid, myDice: this.dice[v], myCount: this.count[v], oppCount: this.count[o], oppDice: rev ? this.dice[o] : null, reveal: this.reveal };
+  }
+}
+
+// ---- Pong à 2 : temps réel, J1 en bas, J2 en haut ----
+const PONG_WIN = 5, PONG_PW = 0.14;
+class PongRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "pong"); this.resetState(); }
+  resetState() { this.score = { 1: 0, 2: 0 }; this.p = { 1: 0.5, 2: 0.5 }; this.winner = null; this.turn = 1; this.pauseUntil = 0; this.serveTo = 1; this.resetBall(); }
+  resetBall() {
+    this.bx = 0.5; this.by = 0.5;
+    const a = (Math.random() - 0.5) * 0.9, sp = 0.6;
+    this.vx = Math.sin(a) * sp; this.vy = Math.cos(a) * sp * (this.serveTo === 1 ? 1 : -1);
+  }
+  begin() {
+    this.pauseUntil = Date.now() + 2200;
+    this.timer = setInterval(() => this.tick(), 33);
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoPaddle" || typeof msg.x !== "number" || !isFinite(msg.x)) return;
+    this.p[num] = Math.max(0, Math.min(1, msg.x));
+  }
+  tick() {
+    if (this.status !== "playing") return;
+    const now = Date.now();
+    if (now >= this.pauseUntil) {
+      const dt = 0.033;
+      this.bx += this.vx * dt; this.by += this.vy * dt;
+      if (this.bx < 0) { this.bx = -this.bx; this.vx = Math.abs(this.vx); }
+      if (this.bx > 1) { this.bx = 2 - this.bx; this.vx = -Math.abs(this.vx); }
+      const hit = (num) => {
+        const off = (this.bx - this.p[num]) / PONG_PW;
+        if (Math.abs(off) > 1.15) return false;
+        this.vy = (num === 1 ? -1 : 1) * Math.min(1.5, Math.abs(this.vy) * 1.07);
+        this.vx = Math.max(-1.1, Math.min(1.1, this.vx + off * 0.35));
+        return true;
+      };
+      if (this.vy > 0 && this.by >= 0.95) {
+        if (hit(1)) this.by = 0.95; else if (this.by > 1.02) this.point(2);
+      } else if (this.vy < 0 && this.by <= 0.05) {
+        if (hit(2)) this.by = 0.05; else if (this.by < -0.02) this.point(1);
+      }
+    }
+    this.broadcast();
+  }
+  point(num) {
+    this.score[num]++;
+    if (this.score[num] >= PONG_WIN) { this.end(num); return; }
+    this.serveTo = num === 1 ? 2 : 1; this.resetBall(); this.pauseUntil = Date.now() + 1300;
+  }
+  extraState() { return { bx: this.bx, by: this.by, p: this.p, score: this.score, win: PONG_WIN, pw: PONG_PW, countdownMs: Math.max(0, this.pauseUntil - Date.now()) }; }
+}
+
+// ---- Duel de maths : premier à répondre juste marque ----
+const MATH_TOTAL = 10, MATH_Q_MS = 12000;
+function makeMathQ(n) {
+  const k = Math.min(n, 10), ri = (a, b) => a + Math.floor(Math.random() * (b - a + 1));
+  const t = ri(0, k < 3 ? 1 : 2);
+  if (t === 0) { const a = ri(5, 20 + k * 8), b = ri(5, 20 + k * 8); return { text: `${a} + ${b}`, a: a + b }; }
+  if (t === 1) { const a = ri(20, 40 + k * 8), b = ri(5, a - 1); return { text: `${a} − ${b}`, a: a - b }; }
+  const a = ri(3, 6 + Math.ceil(k * 0.7)), b = ri(3, 12); return { text: `${a} × ${b}`, a: a * b };
+}
+class MathRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "maths"); this.resetState(); }
+  resetState() { this.scores = { 1: 0, 2: 0 }; this.qn = 0; this.q = null; this.locked = { 1: false, 2: false }; this.phase = "countdown"; this.lastResult = null; this.winner = null; this.qEnds = 0; this.turn = 1; }
+  begin() { this.phase = "countdown"; this.timer = setTimeout(() => this.nextQ(), 2200); }
+  nextQ() {
+    if (this.status !== "playing") return;
+    if (this.qn >= MATH_TOTAL) { const a = this.scores[1], b = this.scores[2]; this.end(a === b ? null : (a > b ? 1 : 2)); return; }
+    this.qn++; this.q = makeMathQ(this.qn); this.locked = { 1: false, 2: false }; this.phase = "question"; this.lastResult = null;
+    this.qEnds = Date.now() + MATH_Q_MS; this.broadcast();
+    this.timer = setTimeout(() => this.resolve(null), MATH_Q_MS);
+  }
+  resolve(by) {
+    this.phase = "result"; this.lastResult = { by, answer: this.q.a }; this.broadcast();
+    this.timer = setTimeout(() => this.nextQ(), 1700);
+  }
+  handleAct(num, msg) {
+    if (msg.type !== "duoAnswer" || this.status !== "playing" || this.phase !== "question" || this.locked[num]) return;
+    const n = Number(msg.n); if (!Number.isFinite(n)) return;
+    if (n === this.q.a) { clearTimeout(this.timer); this.scores[num]++; this.resolve(num); }
+    else {
+      this.locked[num] = true;
+      if (this.locked[1] && this.locked[2]) { clearTimeout(this.timer); this.resolve(null); } else this.broadcast();
+    }
+  }
+  extraState(v) {
+    return { phase: this.phase, qn: this.qn, total: MATH_TOTAL, question: this.phase === "countdown" ? null : (this.q ? this.q.text : null), scores: this.scores, locked: this.locked[v], lastResult: this.lastResult, timeLeftMs: this.phase === "question" ? Math.max(0, this.qEnds - Date.now()) : 0 };
+  }
+}
+
+// ---- Pendu duo : chacun son tour choisit un mot, moins d'erreurs = gagne ----
+const HANG_MAX = 7;
+class HangmanRoom extends SimpleDuoRoom {
+  constructor(code) { super(code, "hangman"); this.resetState(); }
+  resetState() { this.round = 1; this.setter = 1; this.word = null; this.guessed = []; this.errors = 0; this.phase = "setting"; this.results = []; this.winner = null; this.turn = 1; }
+  guesser() { return this.setter === 1 ? 2 : 1; }
+  handleAct(num, msg) {
+    if (this.status !== "playing") return;
+    if (msg.type === "duoWord" && this.phase === "setting" && num === this.setter) {
+      const w = String(msg.word || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toUpperCase().replace(/[^A-Z]/g, "");
+      if (w.length < 3 || w.length > 14) return;
+      this.word = w; this.guessed = []; this.errors = 0; this.phase = "guessing"; this.turn = this.guesser(); this.broadcast();
+    } else if (msg.type === "duoLetter" && this.phase === "guessing" && num === this.guesser()) {
+      const l = String(msg.l || "").toUpperCase();
+      if (!/^[A-Z]$/.test(l) || this.guessed.includes(l)) return;
+      this.guessed.push(l);
+      if (!this.word.includes(l)) this.errors++;
+      const won = this.word.split("").every(ch => this.guessed.includes(ch));
+      if (won || this.errors >= HANG_MAX) {
+        this.results.push({ guesser: this.guesser(), found: won, errors: this.errors, word: this.word });
+        this.phase = "roundEnd"; this.broadcast();
+        this.timer = setTimeout(() => this.nextRound(), 3500);
+        return;
+      }
+      this.broadcast();
+    }
+  }
+  nextRound() {
+    if (this.status !== "playing") return;
+    if (this.round >= 2) {
+      const sc = g => { const r = this.results.find(x => x.guesser === g); return r.found ? r.errors : HANG_MAX + 1; };
+      const a = sc(1), b = sc(2); this.end(a === b ? null : (a < b ? 1 : 2)); return;
+    }
+    this.round = 2; this.setter = 2; this.word = null; this.guessed = []; this.errors = 0; this.phase = "setting"; this.turn = 2; this.broadcast();
+  }
+  extraState(v) {
+    const isSetter = v === this.setter, reveal = this.phase === "roundEnd" || this.status === "ended";
+    return {
+      phase: this.phase, round: this.round, setter: this.setter, isSetter, max: HANG_MAX, errors: this.errors, guessed: this.guessed,
+      wordLen: this.word ? this.word.length : 0,
+      mask: this.word ? this.word.split("").map(ch => (this.guessed.includes(ch) ? ch : "_")) : null,
+      word: this.word && (isSetter || reveal) ? this.word : null, results: this.results,
+    };
+  }
+}
+
 // ---- Registre des rooms en mémoire ----
 const rooms = new Map();
 const duoRooms = new Map();
-const DUO_GAMES = ["battleship", "connect4", "rps", "checkers", "memory", "tug", "gomoku", "pigeons", "mines", "plusmoins"];
+const DUO_GAMES = ["battleship", "connect4", "rps", "checkers", "memory", "tug", "gomoku", "pigeons", "mines", "plusmoins", "hex", "dice", "pong", "maths", "hangman"];
 function getOrCreateDuoRoom(code, game) {
   code = code.toUpperCase();
   let room = duoRooms.get(code);
@@ -2853,6 +3060,11 @@ function createDuoRoomOfGame(code, g) {
   if (g === "pigeons") return new PigeonsRoom(code);
   if (g === "mines") return new MinesRoom(code);
   if (g === "plusmoins") return new PlusMoinsRoom(code);
+  if (g === "hex") return new HexRoom(code);
+  if (g === "dice") return new DiceRoom(code);
+  if (g === "pong") return new PongRoom(code);
+  if (g === "maths") return new MathRoom(code);
+  if (g === "hangman") return new HangmanRoom(code);
   return new DuoRoom(code);
 }
 // Change de mini-jeu entre deux parties : la salle est recréée pour le nouveau jeu avec les deux mêmes joueurs.
@@ -2909,7 +3121,7 @@ duoCleanupInterval.unref();
 
 // ================= MODE MULTI : JEUX DE SOCIÉTÉ À PLUSIEURS (2 à 8 joueurs) =================
 const PARTY_MAX = 8;
-const PARTY_GAMES = ["simon", "potato", "stop10", "memory", "taps", "vote"];
+const PARTY_GAMES = ["simon", "potato", "stop10", "memory", "taps", "vote", "draw", "impostor", "reflex", "liar"];
 const partyRooms = new Map();
 
 // ---- Simon : chacun son tour rejoue toute la séquence puis ajoute une couleur ----
@@ -3295,6 +3507,269 @@ class VoteParty {
   }
 }
 
+// ======================= NOUVEAUX JEUX MULTI (2-8) =======================
+const normTxt = (s) => String(s || "").normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+function rankByTotals(ids, totals, left, tie) {
+  return ids.slice().sort((a, b) => (totals[b] - totals[a]) || (tie ? tie[a] - tie[b] : 0)).map(id => ({ id, score: totals[id], left: left.includes(id) }));
+}
+
+// ---- Dessine-moi ----
+const DRAW_WORDS = ["chat", "maison", "soleil", "voiture", "arbre", "pizza", "bateau", "fusée", "château", "poisson", "vélo", "guitare", "parapluie", "lunettes", "escargot", "robot", "volcan", "éléphant", "montgolfière", "pirate", "requin", "dragon", "clown", "fantôme", "banane", "avion", "train", "horloge", "couronne", "cactus", "araignée", "crabe", "phare", "tortue", "sirène", "tente", "marteau", "clé", "bonhomme de neige", "hamburger", "girafe", "papillon", "ancre", "trésor", "perroquet", "méduse", "palmier", "moto", "cerf-volant", "fleur", "lune", "pomme", "ballon", "cadeau", "télephone", "lit", "gâteau", "sandwich", "hélicoptère", "licorne", "extraterrestre", "pont", "moulin", "pingouin", "glace", "couteau", "ciseaux", "dentiste", "sorcière", "tonneau", "radeau", "baleine"];
+const DRAW_TIME_MS = 60000, DRAW_REVEAL_MS = 4000;
+class DrawParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "draw"; this.ids = ids.slice(); this.left = [];
+    this.totals = {}; ids.forEach(i => { this.totals[i] = 0; });
+    this.order = shuffleArr(ids.slice()).slice(0, Math.min(ids.length, 6));
+    this.words = shuffleArr(DRAW_WORDS).slice(0, this.order.length);
+    this.round = 0; this.phase = "drawing"; this.guessedBy = {}; this.chat = []; this.endsAt = 0; this.timer = null; this.ranking = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  drawer() { return this.order[this.round - 1]; }
+  start() { this.nextRound(); }
+  stop() { clearTimeout(this.timer); }
+  nextRound() {
+    this.round++;
+    while (this.round <= this.order.length && this.left.includes(this.drawer())) this.round++;
+    if (this.round > this.order.length) { this.finishAll(); return; }
+    this.phase = "drawing"; this.guessedBy = {}; this.chat = []; this.endsAt = Date.now() + DRAW_TIME_MS;
+    this.room.broadcast();
+    this.timer = setTimeout(() => this.endRound(), DRAW_TIME_MS);
+  }
+  act(id, msg) {
+    if (this.phase !== "drawing") return;
+    const d = this.drawer();
+    if (id === d) {
+      if (msg.type === "draw" && Array.isArray(msg.pts)) {
+        const pts = msg.pts.slice(0, 60).map(p => [Math.max(0, Math.min(1000, Math.round(+p[0] || 0))), Math.max(0, Math.min(1000, Math.round(+p[1] || 0)))]);
+        const st = { n: !!msg.n, pts, c: String(msg.c || "#000000").replace(/[^#0-9a-fA-F]/g, "").slice(0, 9) || "#000000", w: Math.max(1, Math.min(24, +msg.w || 4)) };
+        this.room.sendAll({ type: "partyDraw", stroke: st });
+      } else if (msg.type === "clear") this.room.sendAll({ type: "partyDraw", clear: true });
+      return;
+    }
+    if (msg.type === "guess" && this.ids.includes(id) && !this.left.includes(id) && this.guessedBy[id] === undefined) {
+      const g = normTxt(msg.text); if (!g) return;
+      if (g === normTxt(this.words[this.round - 1])) {
+        const frac = Math.max(0, (this.endsAt - Date.now()) / DRAW_TIME_MS), pts = Math.round(30 + 70 * frac);
+        this.guessedBy[id] = pts; this.totals[id] += pts; this.totals[d] += 25; this.chat.push({ id, ok: true });
+        if (this.active().filter(i => i !== d).every(i => this.guessedBy[i] !== undefined)) { clearTimeout(this.timer); this.endRound(); return; }
+      } else this.chat.push({ id, t: String(msg.text).slice(0, 24) });
+      if (this.chat.length > 14) this.chat.shift();
+      this.room.broadcast();
+    }
+  }
+  endRound() {
+    this.phase = "reveal"; this.room.broadcast();
+    this.timer = setTimeout(() => this.nextRound(), DRAW_REVEAL_MS);
+  }
+  finishAll() {
+    this.ranking = rankByTotals(this.ids, this.totals, this.left);
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score;
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    if (this.active().length <= 1) { this.stop(); this.finishAll(); return; }
+    if (this.phase === "drawing" && id === this.drawer()) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  state(v) {
+    const d = this.drawer(), word = this.words[this.round - 1] || "";
+    const reveal = this.phase === "reveal" || !!this.ranking;
+    return { game: "draw", phase: this.phase, round: this.round, rounds: this.order.length, drawer: d,
+      word: (v === d || reveal) ? word : null, hint: word.replace(/\p{L}/gu, "_"), timeLeftMs: this.phase === "drawing" ? Math.max(0, this.endsAt - Date.now()) : 0,
+      guessed: this.guessedBy, chat: this.chat, totals: this.totals, left: this.left, ranking: this.ranking };
+  }
+}
+
+// ---- Imposteur ----
+const IMP_PAIRS = [["Chat", "Chien"], ["Plage", "Piscine"], ["Pizza", "Tarte"], ["Vélo", "Moto"], ["Café", "Thé"], ["Lune", "Soleil"], ["Guitare", "Violon"], ["Football", "Rugby"], ["Avion", "Hélicoptère"], ["Pomme", "Poire"], ["Cinéma", "Théâtre"], ["Montagne", "Colline"], ["Requin", "Dauphin"], ["Pirate", "Corsaire"], ["Hiver", "Automne"], ["Livre", "Magazine"], ["Bateau", "Sous-marin"], ["Fraise", "Framboise"], ["Dentiste", "Médecin"], ["Château", "Palais"], ["Baguette", "Croissant"], ["Lion", "Tigre"], ["Rivière", "Lac"], ["Chocolat", "Caramel"]];
+const IMP_CLUE_MS = 20000, IMP_VOTE_MS = 30000;
+class ImpostorParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "impostor"; this.ids = ids.slice(); this.left = [];
+    const pair = shuffleArr(IMP_PAIRS)[0].slice(); if (Math.random() < 0.5) pair.reverse();
+    this.civil = pair[0]; this.impWord = pair[1];
+    this.imp = ids[Math.floor(Math.random() * ids.length)];
+    this.order = shuffleArr(ids.slice()); this.turnIdx = 0; this.clues = {};
+    this.phase = "clues"; this.votes = {}; this.endsAt = 0; this.timer = null; this.result = null; this.endText = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  start() { this.nextClue(); }
+  stop() { clearTimeout(this.timer); }
+  nextClue() {
+    while (this.turnIdx < this.order.length && this.left.includes(this.order[this.turnIdx])) this.turnIdx++;
+    if (this.turnIdx >= this.order.length) { this.startVote(); return; }
+    const id = this.order[this.turnIdx];
+    this.endsAt = Date.now() + IMP_CLUE_MS; this.room.broadcast();
+    this.timer = setTimeout(() => { this.clues[id] = "…"; this.turnIdx++; this.nextClue(); }, IMP_CLUE_MS);
+  }
+  startVote() {
+    this.phase = "voting"; this.votes = {}; this.endsAt = Date.now() + IMP_VOTE_MS; this.room.broadcast();
+    this.timer = setTimeout(() => this.endVote(), IMP_VOTE_MS);
+  }
+  act(id, msg) {
+    if (this.phase === "clues" && msg.type === "clue" && id === this.order[this.turnIdx]) {
+      const t = String(msg.text || "").trim().slice(0, 24); if (!t) return;
+      clearTimeout(this.timer); this.clues[id] = t; this.turnIdx++; this.nextClue();
+    } else if (this.phase === "voting" && msg.type === "vote" && this.votes[id] === undefined && this.ids.includes(id) && !this.left.includes(id) && msg.to !== id && this.ids.includes(msg.to) && !this.left.includes(msg.to)) {
+      this.votes[id] = msg.to;
+      if (this.active().every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.endVote(); } else this.room.broadcast();
+    }
+  }
+  endVote() {
+    const counts = {}; this.ids.forEach(i => { counts[i] = 0; });
+    Object.values(this.votes).forEach(t => { counts[t]++; });
+    const max = Math.max(0, ...Object.values(counts));
+    const top = this.ids.filter(i => counts[i] === max && max > 0);
+    const caught = top.length === 1 && top[0] === this.imp;
+    this.phase = "result"; this.result = { caught, counts, top };
+    this.finishWith(caught);
+  }
+  finishWith(caught) {
+    const winners = caught ? this.ids.filter(i => i !== this.imp && !this.left.includes(i)) : [this.imp];
+    this.endText = caught ? `L'imposteur ${this.nameOf(this.imp)} a été démasqué ! (mot civil : ${this.civil}, imposteur : ${this.impWord})`
+      : `L'imposteur ${this.nameOf(this.imp)} a échappé au vote ! (mot civil : ${this.civil}, imposteur : ${this.impWord})`;
+    this.room.finish(winners[0] === undefined ? null : winners[0], winners);
+  }
+  nameOf(id) { const p = this.room.players.get(id); return p ? p.pseudo : "?"; }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    if (this.room.status === "ended") return;
+    if (id === this.imp) { this.stop(); this.phase = "result"; this.result = { caught: true, counts: {}, top: [] }; this.finishWith(true); return; }
+    if (this.active().length < 3) { this.stop(); this.phase = "result"; this.result = { caught: false, counts: {}, top: [] }; this.finishWith(false); return; }
+    if (this.phase === "clues" && id === this.order[this.turnIdx]) { clearTimeout(this.timer); this.turnIdx++; this.nextClue(); return; }
+    if (this.phase === "voting" && this.active().every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.endVote(); return; }
+    this.room.broadcast();
+  }
+  state(v) {
+    const res = this.phase === "result", voted = {}; Object.keys(this.votes).forEach(k => { voted[k] = true; });
+    return { game: "impostor", phase: this.phase, order: this.order, current: this.phase === "clues" ? this.order[this.turnIdx] : null, clues: this.clues,
+      myWord: v === this.imp ? this.impWord : this.civil, timeLeftMs: this.phase === "result" ? 0 : Math.max(0, this.endsAt - Date.now()), voted,
+      votes: res ? this.votes : null, result: res ? this.result : null, imp: res ? this.imp : null, endText: this.endText, left: this.left };
+  }
+}
+
+// ---- Course de réflexes ----
+const REFLEX_ROUNDS = 5;
+class ReflexParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "reflex"; this.ids = ids.slice(); this.left = [];
+    this.points = {}; this.msTotal = {}; ids.forEach(i => { this.points[i] = 0; this.msTotal[i] = 0; });
+    this.round = 0; this.phase = "wait"; this.taps = {}; this.goAt = 0; this.timer = null; this.ranking = null; this.roundPts = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  start() { this.nextRound(); }
+  stop() { clearTimeout(this.timer); }
+  nextRound() {
+    this.round++; this.phase = "wait"; this.taps = {}; this.roundPts = null; this.room.broadcast();
+    this.timer = setTimeout(() => {
+      this.phase = "go"; this.goAt = Date.now(); this.room.broadcast();
+      this.timer = setTimeout(() => this.endRound(), 3000);
+    }, 1800 + Math.random() * 3500);
+  }
+  act(id, msg) {
+    if (msg.type !== "tap" || this.taps[id] !== undefined || !this.ids.includes(id) || this.left.includes(id)) return;
+    if (this.phase === "wait") this.taps[id] = "early";
+    else if (this.phase === "go") this.taps[id] = Date.now() - this.goAt;
+    else return;
+    if (this.active().every(i => this.taps[i] !== undefined)) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  endRound() {
+    const n = this.active().length;
+    const valid = this.active().filter(i => typeof this.taps[i] === "number").sort((a, b) => this.taps[a] - this.taps[b]);
+    this.roundPts = {};
+    this.ids.forEach(i => { this.roundPts[i] = 0; });
+    valid.forEach((i, r) => { const p = Math.max(1, n - r); this.roundPts[i] = p; this.points[i] += p; this.msTotal[i] += this.taps[i]; });
+    this.active().forEach(i => { if (typeof this.taps[i] !== "number") this.msTotal[i] += 3000; });
+    this.phase = "result"; this.room.broadcast();
+    this.timer = setTimeout(() => { if (this.round >= REFLEX_ROUNDS) this.finishAll(); else this.nextRound(); }, 3200);
+  }
+  finishAll() {
+    this.ranking = rankByTotals(this.ids, this.points, this.left, this.msTotal);
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score && this.msTotal[this.ranking[0].id] === this.msTotal[this.ranking[1].id];
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    if (this.active().length <= 1) { this.stop(); this.finishAll(); return; }
+    if ((this.phase === "wait" || this.phase === "go") && this.active().every(i => this.taps[i] !== undefined)) { clearTimeout(this.timer); this.endRound(); return; }
+    this.room.broadcast();
+  }
+  state() {
+    const tapped = {}; Object.keys(this.taps).forEach(k => { tapped[k] = true; });
+    return { game: "reflex", phase: this.phase, round: this.round, rounds: REFLEX_ROUNDS, tapped, taps: this.phase === "result" ? this.taps : null,
+      roundPts: this.roundPts, points: this.points, left: this.left, ranking: this.ranking };
+  }
+}
+
+// ---- Qui ment ? ----
+const LIAR_WRITE_MS = 45000, LIAR_VOTE_MS = 20000, LIAR_RESULT_MS = 5500;
+class LiarParty {
+  constructor(room, ids) {
+    this.room = room; this.game = "liar"; this.ids = ids.slice(); this.left = [];
+    this.totals = {}; ids.forEach(i => { this.totals[i] = 0; });
+    this.order = shuffleArr(ids.slice()); this.round = 0; this.phase = "writing";
+    this.claim = null; this.truth = null; this.votes = {}; this.endsAt = 0; this.timer = null; this.ranking = null; this.gain = null;
+  }
+  active() { return this.ids.filter(i => !this.left.includes(i)); }
+  narrator() { return this.order[this.round - 1]; }
+  start() { this.nextRound(); }
+  stop() { clearTimeout(this.timer); }
+  nextRound() {
+    this.round++;
+    while (this.round <= this.order.length && this.left.includes(this.narrator())) this.round++;
+    if (this.round > this.order.length) { this.finishAll(); return; }
+    this.phase = "writing"; this.claim = null; this.truth = null; this.votes = {}; this.gain = null;
+    this.endsAt = Date.now() + LIAR_WRITE_MS; this.room.broadcast();
+    this.timer = setTimeout(() => this.showResult(), LIAR_WRITE_MS);
+  }
+  act(id, msg) {
+    if (this.phase === "writing" && msg.type === "claim" && id === this.narrator()) {
+      const t = String(msg.text || "").trim().slice(0, 90);
+      if (t.length < 4 || typeof msg.truth !== "boolean") return;
+      clearTimeout(this.timer); this.claim = t; this.truth = msg.truth; this.phase = "voting"; this.votes = {};
+      this.endsAt = Date.now() + LIAR_VOTE_MS; this.room.broadcast();
+      this.timer = setTimeout(() => this.showResult(), LIAR_VOTE_MS);
+    } else if (this.phase === "voting" && msg.type === "vote" && id !== this.narrator() && this.votes[id] === undefined && typeof msg.v === "boolean" && this.ids.includes(id) && !this.left.includes(id)) {
+      this.votes[id] = msg.v;
+      if (this.active().filter(i => i !== this.narrator()).every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.showResult(); } else this.room.broadcast();
+    }
+  }
+  showResult() {
+    const nar = this.narrator(); let fooled = 0, right = 0;
+    if (this.claim !== null) {
+      Object.keys(this.votes).forEach(k => { if (this.votes[k] === this.truth) { this.totals[k]++; right++; } else fooled++; });
+      this.totals[nar] += fooled;
+    }
+    this.gain = { right, fooled }; this.phase = "result"; this.room.broadcast();
+    this.timer = setTimeout(() => this.nextRound(), LIAR_RESULT_MS);
+  }
+  finishAll() {
+    this.ranking = rankByTotals(this.ids, this.totals, this.left);
+    const tie = this.ranking.length > 1 && this.ranking[0].score === this.ranking[1].score;
+    this.room.finish(tie ? null : this.ranking[0].id);
+  }
+  onLeave(id) {
+    if (!this.ids.includes(id) || this.left.includes(id)) return;
+    this.left.push(id);
+    if (this.active().length <= 1) { this.stop(); this.finishAll(); return; }
+    if ((this.phase === "writing" || this.phase === "voting") && id === this.narrator()) { clearTimeout(this.timer); this.claim = null; this.showResult(); return; }
+    if (this.phase === "voting" && this.active().filter(i => i !== this.narrator()).every(i => this.votes[i] !== undefined)) { clearTimeout(this.timer); this.showResult(); return; }
+    this.room.broadcast();
+  }
+  state() {
+    const res = this.phase === "result", voted = {}; Object.keys(this.votes).forEach(k => { voted[k] = true; });
+    return { game: "liar", phase: this.phase, round: this.round, rounds: this.order.length, narrator: this.narrator(), claim: this.claim,
+      truth: res ? this.truth : null, voted, votes: res ? this.votes : null, gain: this.gain, totals: this.totals, left: this.left,
+      timeLeftMs: (this.phase === "writing" || this.phase === "voting") ? Math.max(0, this.endsAt - Date.now()) : 0, ranking: this.ranking };
+  }
+}
+
 class PartyRoom {
   constructor(code) {
     this.code = code;
@@ -3340,39 +3815,44 @@ class PartyRoom {
       this.startGame();
     } else if (msg.type === "partyBack" && id === this.hostId && this.status === "ended") {
       for (const [pid, p] of this.players) if (!p.connected) this.players.delete(pid);
-      this.status = "lobby"; this.g = null; this.winnerId = null; this.broadcast();
+      this.status = "lobby"; this.g = null; this.winnerId = null; this.winnerIds = null; this.broadcast();
     } else if (msg.type === "partyAct" && this.status === "playing" && this.g) {
       this.g.act(id, Object.assign({}, msg, { type: msg.act }));
     }
   }
   startGame() {
     const ids = this.connectedPlayers().map(p => p.id);
-    if (ids.length < 2) {
+    const minP = this.selectedGame === "impostor" ? 3 : 2;
+    if (ids.length < minP) {
       const host = this.players.get(this.hostId);
-      if (host && host.ws && host.ws.readyState === 1) host.ws.send(JSON.stringify({ type: "partyError", message: "Il faut au moins 2 joueurs pour démarrer." }));
+      if (host && host.ws && host.ws.readyState === 1) host.ws.send(JSON.stringify({ type: "partyError", message: `Il faut au moins ${minP} joueurs pour démarrer.` }));
       return;
     }
     for (const [pid, p] of this.players) if (!p.connected) this.players.delete(pid);
     if (this.g) this.g.stop();
-    this.winnerId = null;
+    this.winnerId = null; this.winnerIds = null;
     this.status = "playing";
-    const GameCls = { simon: SimonParty, potato: PotatoParty, stop10: StopParty, memory: MemoryParty, taps: TapsParty, vote: VoteParty }[this.selectedGame] || SimonParty;
+    const GameCls = { simon: SimonParty, potato: PotatoParty, stop10: StopParty, memory: MemoryParty, taps: TapsParty, vote: VoteParty, draw: DrawParty, impostor: ImpostorParty, reflex: ReflexParty, liar: LiarParty }[this.selectedGame] || SimonParty;
     this.g = new GameCls(this, ids);
     this.g.start();
     this.broadcast();
   }
-  finish(winnerId) {
+  finish(winnerId, winnerIds) {
     if (this.g) this.g.stop();
-    this.status = "ended"; this.winnerId = winnerId;
+    this.status = "ended"; this.winnerId = winnerId; this.winnerIds = winnerIds || (winnerId === null ? [] : [winnerId]);
     this.broadcast();
   }
   stateFor(viewerId) {
     return {
       type: "partyState", code: this.code, status: this.status, hostId: this.hostId, myId: viewerId,
-      selectedGame: this.selectedGame, winnerId: this.winnerId,
+      selectedGame: this.selectedGame, winnerId: this.winnerId, winnerIds: this.winnerIds || (this.winnerId === null || this.winnerId === undefined ? [] : [this.winnerId]),
       players: Array.from(this.players.values()).map(p => ({ id: p.id, pseudo: p.pseudo, connected: p.connected })),
-      game: this.status !== "lobby" && this.g ? this.g.state() : null,
+      game: this.status !== "lobby" && this.g ? this.g.state(viewerId) : null,
     };
+  }
+  sendAll(obj) {
+    const raw = JSON.stringify(obj);
+    for (const p of this.players.values()) if (p.connected && p.ws && p.ws.readyState === 1) p.ws.send(raw);
   }
   broadcast() {
     for (const p of this.players.values()) {
